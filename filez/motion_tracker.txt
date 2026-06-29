@@ -1,0 +1,19 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Arduino_OV767X.h>
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("antes de camera");
+
+    Wire.begin();
+    Wire.setClock(100000);
+    Serial.println("wire ok");
+
+    bool ok = Camera.begin(QQVGA, GRAYSCALE, 1);
+
+    Serial.print("camera result: ");
+    Serial.println(ok ? "OK" : "FALLO");
+}
+void loop() {}

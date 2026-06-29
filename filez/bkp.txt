@@ -1,0 +1,396 @@
+/*
+  ============================================================
+  motion_tracker.cpp
+  Seguimiento de movimiento con OV7675 en Arduino Nano 33 BLE
+  ============================================================
+
+  DESCRIPCIÓN GENERAL:
+  --------------------
+  Este programa captura fotogramas de la cámara OV7675, detecta
+  movimiento mediante diferencia de fotogramas ("frame differencing"),
+  filtra el blob más grande para evitar ruido, calcula la velocidad
+  en píxeles/segundo y envía los datos por Serial (USB) a Python.
+
+  PRINCIPIO DE "FRAME DIFFERENCING":
+  ------------------------------------
+  Se comparan dos fotogramas consecutivos píxel por píxel.
+  Si la diferencia de brillo supera un umbral, ese píxel "cambió".
+  La región de píxeles que cambiaron = zona de movimiento.
+  El centroide de esa región nos da la posición del objeto.
+
+  LIBRERÍA NECESARIA:
+  --------------------
+  Arduino_OV767X — instalar desde:
+  Sketch > Include Library > Manage Libraries > buscar "Arduino_OV767X"
+
+  CONEXIONES (OV7675 → Nano 33 BLE):
+  ------------------------------------
+  OV7675  3.3V  → Nano 3.3V
+  OV7675  GND   → Nano GND
+  OV7675  SIOC  → A5  (SCL - reloj I2C para configurar la cámara)
+  OV7675  SIOD  → A4  (SDA - datos I2C para configurar la cámara)
+  OV7675  VSYNC → 8   (señal de sincronía vertical)
+  OV7675  HREF  → A1  (sincronía horizontal)
+  OV7675  PCLK  → A0  (pixel clock - cadencia de cada píxel)
+  OV7675  XCLK  → 9   (reloj maestro que alimenta la cámara)
+  OV7675  D7-D0 → 4,6,5,3,2,1,0,10 (bus de datos de imagen)
+  OV7675  RESET → 3.3V (en alto = cámara activa)
+  OV7675  PWDN  → GND  (en bajo = cámara encendida)
+
+  PROTOCOLO DE SALIDA (Serial a 115200 baudios):
+  -----------------------------------------------
+  Cada fotograma emite una línea JSON terminada en '\n', por ejemplo:
+  {"cx":82.3,"cy":61.1,"area":420,"spd":14.2,"fps":17.5,"motion":1,
+   "bx":70,"by":50,"bw":30,"bh":25,"frame":143}
+
+  Campos:
+    cx, cy  → centroide del blob de movimiento (píxeles)
+    area    → cantidad de píxeles que cambiaron
+    spd     → velocidad en píxeles/segundo
+    fps     → promedio de fotogramas por segundo (ventana de 10)
+    motion  → 1 si hay movimiento detectable, 0 si no
+    bx,by   → esquina superior izquierda del bounding box
+    bw,bh   → ancho y alto del bounding box
+    frame   → número de fotograma (útil para detectar pérdidas)
+*/
+#include <Arduino.h>
+#include <Arduino_OV767X.h>
+
+void calcularCeldas();
+int encontrarBlobMasGrande(int &outSumCx, int &outSumCy,
+                            int &outMinCx, int &outMaxCx,
+                            int &outMinCy, int &outMaxCy);
+
+
+// ════════════════════════════════════════════════════════════
+// CONSTANTES DE RESOLUCIÓN
+// ════════════════════════════════════════════════════════════
+
+// QQVGA = 160 × 120 píxeles
+// Elegimos esta resolución porque:
+//   - Un fotograma en escala de grises ocupa solo 19,200 bytes
+//   - Necesitamos DOS buffers (actual + anterior) = ~38KB
+//   - El Nano 33 BLE tiene 256KB de RAM → hay margen cómodo
+//   - A mayor resolución (QVGA = 320×240) apenas queda RAM
+#define FRAME_W  160
+#define FRAME_H  120
+#define FRAME_PX (FRAME_W * FRAME_H)   // 19,200 píxeles por fotograma
+
+// ════════════════════════════════════════════════════════════
+// PARÁMETROS DE DETECCIÓN — ajustar si hay falsos positivos
+// ════════════════════════════════════════════════════════════
+
+// Un píxel se considera "en movimiento" si su brillo cambió
+// más de este valor (0-255). Valor bajo = más sensible pero
+// más ruido. Valor alto = menos ruido pero pierde movimiento lento.
+#define DIFF_THRESHOLD   20
+
+// Mínimo de píxeles cambiados para reportar movimiento.
+// Filtra destellos de luz y ruido de sensor.
+// Para un scooter a 5m de distancia, el blob será cientos de píxeles.
+#define MIN_MOTION_AREA  80
+
+// ── Filtro de blob (componente conectado simplificado) ──────
+// Dividimos el fotograma en celdas de CELL_SIZE × CELL_SIZE píxeles.
+// Una celda "activa" es aquella donde más de CELL_THRESHOLD píxeles cambiaron.
+// Solo conservamos el grupo de celdas activas más grande.
+// Esto elimina manchas aisladas de ruido y nos queda el objeto principal.
+#define CELL_SIZE       8     // tamaño de cada celda en píxeles
+#define CELL_COLS       (FRAME_W / CELL_SIZE)   // 20 celdas horizontales
+#define CELL_ROWS       (FRAME_H / CELL_SIZE)   // 15 celdas verticales
+#define CELL_THRESHOLD  4     // píxeles activos mínimos para activar celda
+
+// ════════════════════════════════════════════════════════════
+// BUFFERS DE IMAGEN
+// ════════════════════════════════════════════════════════════
+
+// frameCurrent: fotograma recién capturado
+// framePrev:    fotograma anterior (para la resta)
+// Usamos static para que vivan en RAM de forma permanente
+// (en lugar de en el stack, que es mucho más pequeño).
+static uint8_t frameCurrent[FRAME_PX];
+static uint8_t framePrev[FRAME_PX];
+
+// Grilla de celdas activas (1 = activa, 0 = inactiva)
+// Tamaño: 20 × 15 = 300 bytes, muy pequeño
+static uint8_t cellGrid[CELL_ROWS][CELL_COLS];
+
+// ════════════════════════════════════════════════════════════
+// ESTADO DEL TRACKER
+// ════════════════════════════════════════════════════════════
+
+float prevCx = -1.0f, prevCy = -1.0f;   // centroide del fotograma anterior
+unsigned long prevFrameTime = 0;          // timestamp del último fotograma
+unsigned long frameCount = 0;            // contador de fotogramas totales
+
+// Ventana deslizante para calcular FPS estable
+// En lugar de medir un solo intervalo (ruidoso), promediamos los últimos 10
+#define FPS_WINDOW 10
+unsigned long frameDts[FPS_WINDOW];  // tiempos entre fotogramas (ms)
+uint8_t fpsIdx = 0;                  // índice circular en el array
+
+// ════════════════════════════════════════════════════════════
+// SETUP — se ejecuta una sola vez al encender
+// ════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  // Esperamos a que Python abra el puerto Serial
+  // (si no hay nadie escuchando, los datos se descartan de todas formas)
+  while (!Serial && millis() < 3000);
+
+  Serial.println("{\"status\":\"iniciando\"}");
+
+  // Inicializamos la cámara en modo escala de grises, resolución QQVGA.
+  // El tercer parámetro (1) es el fps inicial — la librería lo usa
+  // internamente para configurar el PLL de la cámara. En la práctica
+  // el Nano captura tan rápido como puede.
+  if (!Camera.begin(QQVGA, GRAYSCALE, 1)) {
+    Serial.println("{\"status\":\"error\",\"msg\":\"Fallo al iniciar camara\"}");
+    while (1);  // Detenemos todo — sin cámara no hay proyecto
+  }
+
+  Serial.println("{\"status\":\"lista\",\"w\":160,\"h\":120}");
+
+  // Capturamos el primer fotograma para tener un "anterior" válido
+  // desde el primer ciclo de loop(). Sin esto, el primer diff sería basura.
+  Camera.readFrame(framePrev);
+  prevFrameTime = millis();
+
+  // Inicializamos el buffer de tiempos en 0
+  memset(frameDts, 0, sizeof(frameDts));
+}
+
+// ════════════════════════════════════════════════════════════
+// FUNCIÓN: calcularCeldas
+// Convierte el mapa de píxeles activos en una grilla de celdas.
+// Cada celda resume si su región tiene suficiente movimiento.
+// Esto es un "pooling" manual, igual al concepto en redes neuronales.
+// ════════════════════════════════════════════════════════════
+void calcularCeldas() {
+  memset(cellGrid, 0, sizeof(cellGrid));
+
+  for (int cy = 0; cy < CELL_ROWS; cy++) {
+    for (int cx = 0; cx < CELL_COLS; cx++) {
+      int count = 0;
+      // Recorremos los CELL_SIZE × CELL_SIZE píxeles de esta celda
+      for (int py = 0; py < CELL_SIZE; py++) {
+        for (int px = 0; px < CELL_SIZE; px++) {
+          int pixelY = cy * CELL_SIZE + py;
+          int pixelX = cx * CELL_SIZE + px;
+          int idx = pixelY * FRAME_W + pixelX;
+
+          int diff = (int)frameCurrent[idx] - (int)framePrev[idx];
+          if (diff < 0) diff = -diff;
+          if (diff > DIFF_THRESHOLD) count++;
+        }
+      }
+      // La celda queda activa si suficientes píxeles cambiaron
+      if (count >= CELL_THRESHOLD) cellGrid[cy][cx] = 1;
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// FUNCIÓN: encontrarBlobMasGrande
+// BFS (búsqueda por anchura) sobre la grilla de celdas activas.
+// Encuentra el grupo de celdas conectadas más grande.
+// Retorna el área en celdas; escribe bbox y suma de coordenadas.
+//
+// ¿Por qué BFS y no algo más simple?
+// Porque el scooter puede generar múltiples manchas separadas
+// (ruedas, cuerpo, manos). BFS nos da el grupo más grande y
+// descarta ruido aislado de forma limpia.
+// ════════════════════════════════════════════════════════════
+int encontrarBlobMasGrande(int &outSumCx, int &outSumCy,
+                            int &outMinCx, int &outMaxCx,
+                            int &outMinCy, int &outMaxCy) {
+  // Mapa de celdas ya visitadas por el BFS
+  static uint8_t visited[CELL_ROWS][CELL_COLS];
+  memset(visited, 0, sizeof(visited));
+
+  // Cola del BFS — celdas pendientes de explorar
+  // Tamaño máximo: todas las celdas de la grilla (300)
+  static uint8_t queueCx[CELL_ROWS * CELL_COLS];
+  static uint8_t queueCy[CELL_ROWS * CELL_COLS];
+
+  int bestArea = 0;
+  int bestSumCx = 0, bestSumCy = 0;
+  int bestMinCx = CELL_COLS, bestMaxCx = 0;
+  int bestMinCy = CELL_ROWS, bestMaxCy = 0;
+
+  // Vecinos en 4 direcciones (arriba, abajo, izquierda, derecha)
+  const int8_t dx[] = {1, -1, 0,  0};
+  const int8_t dy[] = {0,  0, 1, -1};
+
+  for (int startY = 0; startY < CELL_ROWS; startY++) {
+    for (int startX = 0; startX < CELL_COLS; startX++) {
+      // Saltamos celdas inactivas o ya visitadas
+      if (!cellGrid[startY][startX] || visited[startY][startX]) continue;
+
+      // Nueva componente conectada — iniciamos BFS desde aquí
+      int head = 0, tail = 0;
+      int area = 0;
+      int sumCx = 0, sumCy = 0;
+      int minCx = startX, maxCx = startX;
+      int minCy = startY, maxCy = startY;
+
+      queueCx[tail] = startX;
+      queueCy[tail] = startY;
+      tail++;
+      visited[startY][startX] = 1;
+
+      while (head < tail) {
+        int cx = queueCx[head];
+        int cy = queueCy[head];
+        head++;
+
+        // Acumulamos para centroide y bbox de este blob
+        area++;
+        sumCx += cx;
+        sumCy += cy;
+        if (cx < minCx) minCx = cx;
+        if (cx > maxCx) maxCx = cx;
+        if (cy < minCy) minCy = cy;
+        if (cy > maxCy) maxCy = cy;
+
+        // Exploramos los 4 vecinos
+        for (int d = 0; d < 4; d++) {
+          int nx = cx + dx[d];
+          int ny = cy + dy[d];
+          if (nx < 0 || nx >= CELL_COLS || ny < 0 || ny >= CELL_ROWS) continue;
+          if (!cellGrid[ny][nx] || visited[ny][nx]) continue;
+
+          visited[ny][nx] = 1;
+          queueCx[tail] = nx;
+          queueCy[tail] = ny;
+          tail++;
+        }
+      }
+
+      // ¿Es este blob más grande que el mejor hasta ahora?
+      if (area > bestArea) {
+        bestArea  = area;
+        bestSumCx = sumCx;  bestSumCy = sumCy;
+        bestMinCx = minCx;  bestMaxCx = maxCx;
+        bestMinCy = minCy;  bestMaxCy = maxCy;
+      }
+    }
+  }
+
+  // Devolvemos resultados por referencia
+  outSumCx = bestSumCx; outSumCy = bestSumCy;
+  outMinCx = bestMinCx; outMaxCx = bestMaxCx;
+  outMinCy = bestMinCy; outMaxCy = bestMaxCy;
+  return bestArea;  // en celdas; multiplicar por CELL_SIZE para píxeles
+}
+
+// ════════════════════════════════════════════════════════════
+// LOOP — se ejecuta continuamente
+// ════════════════════════════════════════════════════════════
+void loop() {
+  unsigned long t0 = millis();
+
+  // ── 1. CAPTURA DEL FOTOGRAMA ACTUAL ─────────────────────
+  // readFrame() bloquea hasta recibir un fotograma completo de la cámara.
+  // En QQVGA escala de grises esto tarda ~50-70ms → ~15-20fps.
+  Camera.readFrame(frameCurrent);
+
+  // Medimos cuánto tiempo pasó desde el fotograma anterior
+  unsigned long t1 = millis();
+  unsigned long dt = t1 - prevFrameTime;   // ms entre fotogramas
+  prevFrameTime = t1;
+
+  // ── 2. CÁLCULO DE FPS (ventana deslizante) ──────────────
+  // Guardamos los últimos FPS_WINDOW intervalos y promediamos.
+  // Esto suaviza el fps visible — un solo frame raro no lo distorsiona.
+  frameDts[fpsIdx] = dt;
+  fpsIdx = (fpsIdx + 1) % FPS_WINDOW;
+
+  unsigned long sumDt = 0;
+  uint8_t validFrames = 0;
+  for (int i = 0; i < FPS_WINDOW; i++) {
+    if (frameDts[i] > 0) { sumDt += frameDts[i]; validFrames++; }
+  }
+  float fps = (validFrames > 0 && sumDt > 0)
+              ? (validFrames * 1000.0f / sumDt)
+              : 0.0f;
+
+  // ── 3. GRILLA DE CELDAS ─────────────────────────────────
+  // Resumimos el mapa de píxeles en una grilla de 20×15 celdas.
+  calcularCeldas();
+
+  // ── 4. BLOB MÁS GRANDE (BFS) ────────────────────────────
+  int sumCx, sumCy, minCx, maxCx, minCy, maxCy;
+  int blobArea = encontrarBlobMasGrande(sumCx, sumCy,
+                                         minCx, maxCx,
+                                         minCy, maxCy);
+
+  // Convertimos área de celdas a área aproximada en píxeles
+  // (cada celda tiene CELL_SIZE² píxeles)
+  long pixelArea = (long)blobArea * CELL_SIZE * CELL_SIZE;
+
+  // ── 5. CENTROIDE Y VELOCIDAD ─────────────────────────────
+  float cx = -1.0f, cy = -1.0f, speed = 0.0f;
+  bool motion = (pixelArea >= MIN_MOTION_AREA);
+
+  if (motion) {
+    // Centroide en coordenadas de celda → convertir a píxeles
+    // sumCx/blobArea da el centroide en índices de celda,
+    // multiplicamos por CELL_SIZE para obtener píxeles.
+    cx = ((float)sumCx / blobArea) * CELL_SIZE + CELL_SIZE / 2.0f;
+    cy = ((float)sumCy / blobArea) * CELL_SIZE + CELL_SIZE / 2.0f;
+
+    if (prevCx >= 0 && dt > 0) {
+      // Distancia Euclidiana entre centroides consecutivos
+      float dx = cx - prevCx;
+      float dy = cy - prevCy;
+      float distPx = sqrtf(dx * dx + dy * dy);
+
+      // Velocidad = distancia / tiempo
+      // dt está en milisegundos → dividimos por 1000 para segundos
+      speed = distPx / (dt / 1000.0f);  // unidad: píxeles/segundo
+    }
+
+    prevCx = cx;
+    prevCy = cy;
+  } else {
+    // Sin movimiento suficiente: velocidad cero
+    speed = 0.0f;
+  }
+
+  frameCount++;
+
+  // ── 6. EMISIÓN JSON POR SERIAL ───────────────────────────
+  // Enviamos UNA línea JSON por fotograma.
+  // Python lee línea por línea → sin pérdida de sincronía.
+  //
+  // Usamos print() encadenado en lugar de sprintf() para evitar
+  // usar el stack de forma pesada (sprintf con floats consume ~200 bytes
+  // de stack temporal en ARM Cortex-M4).
+
+  // Bounding box en píxeles (desde coordenadas de celda)
+  int bbX = minCx * CELL_SIZE;
+  int bbY = minCy * CELL_SIZE;
+  int bbW = (maxCx - minCx + 1) * CELL_SIZE;
+  int bbH = (maxCy - minCy + 1) * CELL_SIZE;
+
+  Serial.print("{");
+  Serial.print("\"cx\":"); Serial.print(cx, 1);   Serial.print(",");
+  Serial.print("\"cy\":"); Serial.print(cy, 1);   Serial.print(",");
+  Serial.print("\"area\":"); Serial.print(pixelArea); Serial.print(",");
+  Serial.print("\"spd\":"); Serial.print(speed, 1); Serial.print(",");
+  Serial.print("\"fps\":"); Serial.print(fps, 1);  Serial.print(",");
+  Serial.print("\"motion\":"); Serial.print(motion ? 1 : 0); Serial.print(",");
+  Serial.print("\"bx\":"); Serial.print(motion ? bbX : 0); Serial.print(",");
+  Serial.print("\"by\":"); Serial.print(motion ? bbY : 0); Serial.print(",");
+  Serial.print("\"bw\":"); Serial.print(motion ? bbW : 0); Serial.print(",");
+  Serial.print("\"bh\":"); Serial.print(motion ? bbH : 0); Serial.print(",");
+  Serial.print("\"frame\":"); Serial.print(frameCount);
+  Serial.println("}");  // '\n' termina la línea → Python hace readline()
+
+  // ── 7. SWAP DE BUFFERS ───────────────────────────────────
+  // El fotograma actual se convierte en el "anterior" para el próximo ciclo.
+  // memcpy copia los 19,200 bytes — tarda ~0.3ms en el Cortex-M4.
+  memcpy(framePrev, frameCurrent, FRAME_PX);
+}
