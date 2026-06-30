@@ -52,8 +52,6 @@ del Nano 33 BLE — no se pueden cambiar sin modificar la librería:
 |---|---|
 | `src/main.cpp` | Firmware Arduino: captura, procesamiento, envío Serial |
 | `visualizador.py` | Visualizador Python: imagen en vivo + tracking + velocidad |
-| `camtest.cpp` | Test de cámara: mide FPS real y muestra imagen cruda |
-| `camtest_viewer.py` | Visor para camtest: diagnóstico de imagen y latencia |
 
 ---
 
@@ -98,16 +96,6 @@ pip install pygame pyserial numpy
    python visualizador.py
    ```
 6. Ajusta el slider **Distancia (m)** a la distancia real entre la cámara y el objeto
-
-### Quirks del Nano 33 BLE Rev2 con PlatformIO
-
-- El monitor de PIO no muestra output si no tiene `monitor_speed = 115200` en `platformio.ini`
-- "Upload and Monitor" a veces falla — hacer Upload primero, luego abrir monitor por separado
-- Si el monitor sigue sin mostrar nada, usar el script de diagnóstico Python directamente
-- Si PIO parece compilar código viejo: borrar la carpeta `.pio/` y hacer clean antes de upload
-- El archivo siempre debe llamarse `main.cpp` dentro de `src/` — PIO lo requiere como entry point
-- Agregar `#include <Arduino.h>` al inicio y prototipos de funciones antes de `setup()` —
-  el IDE de Arduino los generaba automáticamente, PIO no
 
 ---
 
@@ -187,8 +175,7 @@ El JSON contiene:
 
 - **FPS:** ~2.5 FPS real. El límite es el hardware — el nRF52840 no tiene periférico
   de captura de imagen y la librería lee los píxeles por GPIO (~350ms por frame).
-- **Velocidad:** es una estimación. Requiere calibrar la distancia con el slider.
-  El ángulo de la cámara respecto al trayecto afecta la precisión.
+- **Velocidad:** es una estimación. El ángulo de la cámara respecto al trayecto afecta la precisión.
 - **Iluminación:** la OV7675 necesita buena luz para auto-exposición correcta.
   Con poca luz la imagen es muy oscura y el detector falla.
 - **Fondo en movimiento:** sombras o variaciones de luz generan falsos positivos.
